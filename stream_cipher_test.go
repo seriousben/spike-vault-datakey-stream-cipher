@@ -7,18 +7,155 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 
+	consulapi "github.com/hashicorp/consul/api"
+	"github.com/hashicorp/go-cleanhttp"
 	"github.com/hashicorp/vault/api"
 	"github.com/hashicorp/vault/builtin/logical/transit"
 	vaulthttp "github.com/hashicorp/vault/http"
 	"github.com/hashicorp/vault/sdk/logical"
 	"github.com/hashicorp/vault/vault"
 )
+
+func Test_EncryptDecryptFromConsulToFile(t *testing.T) {
+	consulClient, err := consulapi.NewClient(&consulapi.Config{
+		Address:   "http://127.0.0.1:8500",
+		Scheme:    "http",
+		Transport: cleanhttp.DefaultPooledTransport(),
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	rc, meta, err := consulClient.Snapshot().Save(&consulapi.QueryOptions{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer rc.Close()
+	t.Logf("Meta: %+v\n", meta)
+
+	// iv is the initialization vector
+	iv := make([]byte, aes.BlockSize)
+	if _, err := rand.Read(iv); err != nil {
+		t.Fatal(err)
+	}
+
+	// key is the AES key
+	key := make([]byte, keySize)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatal(err)
+	}
+
+	// encrypt
+	encr, err := EncryptReader(rc, key, iv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encf, err := os.Create("enc.tgz")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer encf.Close()
+
+	decf, err := os.Create("dec.tgz")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer decf.Close()
+
+	er, ew := io.Pipe()
+
+	// decrypt
+	decr, err := EncryptReader(er, key, iv)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	w := io.MultiWriter(ew, encf)
+
+	ch := make(chan struct{})
+
+	go func() {
+		t.Log("Copying to decrypted file")
+		_, err = io.Copy(decf, decr)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		t.Log("Closing channel")
+		close(ch)
+	}()
+
+	_, err = io.Copy(w, encr)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	t.Log("Close writes")
+	err = ew.Close()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	t.Log("Waiting for decryption")
+	<-ch
+
+	// ensure file is written
+	err = encf.Sync()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// read file from zero
+	_, err = encf.Seek(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	decr, err = EncryptReader(encf, key, iv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	decf2, err := os.Create("dec2.tgz")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer decf2.Close()
+
+	_, err = io.Copy(decf2, decr)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// read file from zero
+	_, err = encf.Seek(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	decr, err = EncryptReader(encf, key, iv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = consulClient.Snapshot().Restore(&consulapi.WriteOptions{}, decr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = io.Copy(decf2, decr)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
 
 func Test_EncryptDecrypt(t *testing.T) {
 	// iv is the initialization vector
